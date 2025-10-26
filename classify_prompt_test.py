@@ -82,27 +82,19 @@ def read_comments(path: str) -> List[Dict[str, Any]]:
                 continue
             if not isinstance(obj, dict):
                 continue
-            # The source files can expose the comment text via either a "text" or
-            # "body" field. Accept both so we can run against the cleaner output
-            # without rewriting the data on disk.
-            if "id" not in obj:
+            if "id" not in obj or "text" not in obj:
                 continue
-            text_val = obj.get("text") or obj.get("body")
-            if text_val is None:
-                continue
-            comments.append({"id": str(obj["id"]), "text": str(text_val)})
+            comments.append({"id": str(obj["id"]), "text": str(obj["text"])})
     return comments
 
 
-def choose_sample(
-    comments: List[Dict[str, Any]], size: int, rng: random.Random
-) -> List[Dict[str, Any]]:
+def choose_sample(comments: List[Dict[str, Any]], size: int) -> List[Dict[str, Any]]:
     if size >= len(comments):
         print(
             f"Requested sample of {size} comments but only {len(comments)} available; using all comments."
         )
-        return list(comments) if not comments else rng.sample(comments, len(comments))
-    return rng.sample(comments, size)
+        return comments
+    return random.sample(comments, size)
 
 
 def chunked(data: List[Dict[str, Any]], chunk_size: int) -> Iterable[List[Dict[str, Any]]]:
@@ -151,13 +143,8 @@ def main() -> None:
     if args.sample_size <= 0:
         raise SystemExit("Sample size must be a positive integer")
 
-    rng = random.Random()
     if args.seed is not None:
-        rng.seed(args.seed)
-
-    # Avoid mutating global random state so repeated runs without --seed remain random.
-    if args.seed is None:
-        rng.seed()
+        random.seed(args.seed)
 
     configure_api(args)
 
@@ -165,7 +152,7 @@ def main() -> None:
     if not comments:
         raise SystemExit(f"No comments found in {args.input_path}")
 
-    sample = choose_sample(comments, args.sample_size, rng)
+    sample = choose_sample(comments, args.sample_size)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -191,7 +178,6 @@ def main() -> None:
         "output_file": str(output_path),
         "model": args.model,
         "generated_at": timestamp,
-        "seed": args.seed,
     }
     meta_path = output_dir / f"sample_{len(sample)}_{timestamp}_meta.json"
     with open(meta_path, "w", encoding="utf-8") as meta_file:
