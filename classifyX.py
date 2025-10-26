@@ -17,7 +17,7 @@ import hashlib
 import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter, deque
+from collections import Counter, deque, OrderedDict
 
 # ---------------- CONFIG ----------------
 INPUT_PATH = "kenya_clean_utf8.jsonl"   # .jsonl (default) or JSON array; .gz also supported
@@ -36,13 +36,19 @@ SLEEP_BETWEEN_BATCHES = 0.3
 CHECKPOINT_FLUSH_N = 200         # buffer checkpoint writes
 CACHE_DB = OUTPUT_DIR / "cache.sqlite3"
 
+# --- Drift monitoring knobs ---
+RECHECK_PROB_CACHE = 0.02        # fraction of cache hits to revalidate
+RECHECK_PROB_HEURISTIC = 0.08    # fraction of heuristic hits to revalidate
+RECHECK_BATCH_SIZE = 10          # batch size for background rechecks
+RECHECK_MAX_WORKERS = 2          # low concurrency to avoid extra load
+
+# --- Memory safety ---
+ORIGINAL_MAP_LIMIT = 20_000      # cap stored originals for alignment
+
 # ---------------- API KEY/BASE ----------------
 import openai
-openai.api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+openai.api_key = "sk-33a98b12f11f4300857e5ca93bf90e24"
 openai.api_base = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com").strip()
-
-if not openai.api_key:
-    raise SystemExit("Missing DEEPSEEK_API_KEY env var")
 
 # ---------------- LOGGING ----------------
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
@@ -94,6 +100,10 @@ def cache_get(h: str):
 def cache_set_many(pairs):
     # pairs: list[(hash, label)]
     CACHE_CUR.executemany("INSERT OR REPLACE INTO cache(h,label) VALUES(?,?)", pairs)
+    CACHE_CONN.commit()
+
+def cache_delete(h: str):
+    CACHE_CUR.execute("DELETE FROM cache WHERE h=?", (h,))
     CACHE_CONN.commit()
 
 @atexit.register
@@ -187,7 +197,9 @@ def get_unprocessed_lines(path: str, already_done_ids: set):
                     continue
                 try:
                     rec = json.loads(line)
-                except Exception:
+                except Exception as e:
+                    skip_stats["input_parse_error"] += 1
+                    logging.warning(f"Skipping malformed JSON line: {e}")
                     continue
                 cid = rec.get("id") or rec.get("_id") or rec.get("cid")
                 if cid and cid in already_done_ids:
@@ -200,6 +212,7 @@ def get_unprocessed_lines(path: str, already_done_ids: set):
                 arr = json.load(f)
             except Exception as e:
                 logging.error(f"Failed to parse JSON array: {e}")
+                skip_stats["input_parse_error"] += 1
                 return
         for rec in arr:
             if not isinstance(rec, dict):
@@ -287,6 +300,68 @@ def make_user_block(batch):
     return "\n".join(lines)
 
 # ---------------- DEEPSEEK CALL ----------------
+def _parse_model_json_response(txt: str):
+    """Best-effort parser that tolerates loose JSON lines/arrays."""
+    results = []
+    invalid_chunks = 0
+    if not txt:
+        return results, invalid_chunks
+
+    def _consume_obj(obj):
+        nonlocal invalid_chunks
+        if isinstance(obj, dict):
+            cid = obj.get("id")
+            lang = obj.get("language")
+            if cid and lang:
+                results.append({"id": cid, "language": lang})
+            else:
+                invalid_chunks += 1
+        elif isinstance(obj, list):
+            for entry in obj:
+                _consume_obj(entry)
+        else:
+            invalid_chunks += 1
+
+    stripped = txt.strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if parsed is not None:
+        _consume_obj(parsed)
+        if results:
+            return results, invalid_chunks
+
+    # fallback: parse line by line / embedded json substrings
+    for raw in stripped.splitlines():
+        part = raw.strip()
+        if not part:
+            continue
+        # try to extract balanced braces if the line has noise around JSON
+        if not part.startswith("{"):
+            start = part.find("{")
+            end = part.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                part = part[start: end + 1]
+        if "[" in part and "]" in part and part.count("{") > 1:
+            try:
+                parsed = json.loads(part)
+                _consume_obj(parsed)
+                continue
+            except Exception:
+                invalid_chunks += 1
+                continue
+        try:
+            parsed = json.loads(part)
+        except Exception:
+            invalid_chunks += 1
+            continue
+        _consume_obj(parsed)
+
+    return results, invalid_chunks
+
+
 def deepseek_batch(batch):
     """
     Stable micro-batch caller with:
@@ -314,34 +389,9 @@ def deepseek_batch(batch):
                 max_tokens=1200,  # safe for <=15 outputs
             )
             txt = (r["choices"][0]["message"]["content"] or "").strip()
-            # parse as JSON-LINES
-            out = []
-            for line in txt.splitlines():
-                s = line.strip()
-                if not s:
-                    continue
-                try:
-                    obj = json.loads(s)
-                except Exception:
-                    # try bracket slice in case the model returned array chunk by mistake
-                    if "[" in s and "]" in s:
-                        try:
-                            arr = json.loads(s[s.find("["): s.rfind("]") + 1])
-                            for it in arr:
-                                out.append({"id": it["id"], "language": it["language"]})
-                            continue
-                        except Exception:
-                            pass
-                    # skip malformed line
-                    continue
-                if "id" in obj and "language" in obj:
-                    out.append({"id": obj["id"], "language": obj["language"]})
-            # final sanity: ensure order & 1:1 mapping if possible
-            got = {o["id"] for o in out if "id" in o}
-            expect = [b["id"] for b in batch]
-            if len(out) != len(batch) or any(eid not in got for eid in expect):
-                # try soft alignment using first-come
-                pass  # we accept partial for now; missing will be retried per-item below
+            out, invalid_chunks = _parse_model_json_response(txt)
+            if invalid_chunks:
+                logging.warning(f"Model output had {invalid_chunks} unparsable chunk(s); continuing with {len(out)} record(s).")
             # attach meta for tuning (not used here but kept)
             latency = time.time() - start
             for o in out:
@@ -369,10 +419,13 @@ def deepseek_batch(batch):
                             max_tokens=200,
                         )
                         line = (r2["choices"][0]["message"]["content"] or "").strip()
-                        # expect single json line
-                        obj = json.loads(line) if line.startswith("{") else json.loads(line[line.find("{"): line.rfind("}")+1])
-                        if "id" in obj and "language" in obj:
-                            results.append({"id": obj["id"], "language": obj["language"]})
+                        parsed, invalid_chunks = _parse_model_json_response(line)
+                        if invalid_chunks:
+                            logging.warning(
+                                f"Per-item response for {b['id']} had {invalid_chunks} unparsable chunk(s)."
+                            )
+                        for obj in parsed:
+                            results.append(obj)
                     except Exception as ie:
                         logging.warning(f"Per-item skip due to filter/parse: {ie}")
                         continue
@@ -469,27 +522,42 @@ def main():
     total = 0
     batcher = TokenBudgetBatcher()
     futures = []
+    pending_batches = {}
     tok_hist = deque()
     cache_pairs = []  # for bulk sqlite insert
+    recheck_buffer = []
+    recheck_futures = []
+    recheck_stats = Counter()
+    recheck_seq = 0
 
     def submit_batch(executor, batch):
         if not batch:
             return
-        futures.append(executor.submit(deepseek_batch, batch))
+        fut = executor.submit(deepseek_batch, batch)
+        futures.append(fut)
+        # store a shallow copy so retries know which ids were expected
+        pending_batches[fut] = [dict(item) for item in batch]
 
-    def write_results(results, original_by_id):
+    def write_results(results, original_by_id, expected_lookup=None):
         nonlocal total, cache_pairs
         out = []
+        processed_ids = set()
         for r in results:
             cid = r.get("id")
             lang = r.get("language")
             if not cid or not lang:
                 continue
-            text = original_by_id.get(cid, "")
+            text = original_by_id.pop(cid, None)
+            if text is None and expected_lookup:
+                text = expected_lookup.get(cid)
+            if text is None:
+                text = ""
+            processed_ids.add(cid)
             out.append({"id": cid, "text": text, "language": lang})
 
             # persistent cache
-            cache_pairs.append((md5_hash(text), lang))
+            if text:
+                cache_pairs.append((md5_hash(text), lang))
 
         if out:
             writer_q.put(out)
@@ -499,10 +567,119 @@ def main():
             cache_set_many(cache_pairs)
             cache_pairs = []
 
-    # Maintain a sliding dict of originals for batch alignment
-    original_map = {}
+        return processed_ids
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    def handle_missing_items(missing_items):
+        """Retry items that failed to parse or were dropped."""
+        for item in missing_items:
+            cid = item.get("id")
+            if not cid:
+                continue
+            text = original_map.get(cid) or item.get("text") or ""
+            if not text:
+                skip_stats["missing_text_for_retry"] += 1
+                continue
+            payload = {"id": cid, "text": text}
+            recovered = False
+            for attempt in range(1, RETRIES + 1):
+                single_result = deepseek_batch([payload])
+                if single_result:
+                    processed = write_results(single_result, original_map, {cid: text})
+                    if cid in processed:
+                        recovered = True
+                        break
+                sleep_for = min(5.0, 1.5 * attempt)
+                time.sleep(sleep_for)
+            if not recovered:
+                skip_stats["unrecoverable_model_output"] += 1
+                original_map.pop(cid, None)
+                logging.error(
+                    f"Failed to recover classification for {cid} after {RETRIES} retries; skipping." 
+                )
+
+    # Maintain a sliding dict of originals for batch alignment
+    original_map = OrderedDict()
+
+    def dispatch_recheck(executor):
+        nonlocal recheck_buffer
+        if not recheck_buffer:
+            return
+        payload = [{"id": item["recheck_id"], "text": item["text"]} for item in recheck_buffer]
+        meta = {item["recheck_id"]: item for item in recheck_buffer}
+        future = executor.submit(deepseek_batch, payload)
+        recheck_futures.append((future, meta))
+        recheck_buffer = []
+
+    def schedule_recheck(executor, item_id, text, expected, h, source):
+        nonlocal recheck_seq
+        recheck_seq += 1
+        re_id = f"recheck::{item_id}::{recheck_seq}"
+        recheck_buffer.append(
+            {
+                "recheck_id": re_id,
+                "original_id": item_id,
+                "text": text,
+                "expected": expected,
+                "hash": h,
+                "source": source,
+            }
+        )
+        if len(recheck_buffer) >= RECHECK_BATCH_SIZE:
+            dispatch_recheck(executor)
+
+    def process_recheck_futures(done_only=True):
+        nonlocal recheck_futures, cache_pairs
+        remaining = []
+        for fut, meta in recheck_futures:
+            if done_only and not fut.done():
+                remaining.append((fut, meta))
+                continue
+            if not fut.done():
+                remaining.append((fut, meta))
+                continue
+            try:
+                results = fut.result()
+            except Exception as e:
+                logging.warning(f"Recheck batch failed: {e}")
+                continue
+            seen = set()
+            for obj in results or []:
+                rid = obj.get("id")
+                lang = obj.get("language")
+                if not rid or rid not in meta:
+                    continue
+                item = meta[rid]
+                seen.add(rid)
+                expected = item.get("expected")
+                if not lang:
+                    continue
+                if lang != expected:
+                    recheck_stats["mismatch"] += 1
+                    logging.warning(
+                        f"Recheck drift detected for {item['original_id']} ({item['source']}): "
+                        f"expected {expected}, got {lang}."
+                    )
+                    h = item.get("hash")
+                    if h:
+                        cache_delete(h)
+                        for idx, (hh, lbl) in enumerate(cache_pairs):
+                            if hh == h:
+                                cache_pairs[idx] = (hh, lang)
+                                break
+                        else:
+                            cache_set_many([(h, lang)])
+                else:
+                    recheck_stats["match"] += 1
+            missing = set(meta.keys()) - seen
+            for rid in missing:
+                item = meta[rid]
+                logging.warning(
+                    f"Recheck returned no result for {item['original_id']} ({item['source']})."
+                )
+                recheck_stats["missing"] += 1
+        recheck_futures = remaining
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex, ThreadPoolExecutor(max_workers=RECHECK_MAX_WORKERS) as rex:
         for rec in stream:
             cid = rec.get("id") or rec.get("_id") or rec.get("cid")
             text = rec.get("body") or rec.get("text") or ""
@@ -515,6 +692,8 @@ def main():
             if cached:
                 writer_q.put([{"id": cid, "text": text, "language": cached}])
                 total += 1
+                if random.random() < RECHECK_PROB_CACHE:
+                    schedule_recheck(rex, cid, text, cached, h, "cache")
                 continue
 
             # fast heuristic (skip DeepSeek if confident)
@@ -526,10 +705,15 @@ def main():
                 if len(cache_pairs) >= 2000:
                     cache_set_many(cache_pairs)
                     cache_pairs = []
+                if random.random() < RECHECK_PROB_HEURISTIC:
+                    schedule_recheck(rex, cid, text, guess, h, "heuristic")
                 continue
 
             item = {"id": cid, "text": text}
             original_map[cid] = text
+            original_map.move_to_end(cid)
+            while len(original_map) > ORIGINAL_MAP_LIMIT:
+                original_map.popitem(last=False)
             ready = batcher.add(item)
             if ready:
                 submit_batch(ex, ready)
@@ -539,19 +723,32 @@ def main():
             if len(futures) >= MAX_WORKERS * 2:
                 sum_latency = 0.0
                 meta_batches = 0
-                for fut in as_completed(futures):
+                for fut in as_completed(list(futures)):
+                    futures.remove(fut)
+                    expected_batch = pending_batches.pop(fut, [])
+                    expected_lookup = {
+                        itm.get("id"): itm.get("text", "") for itm in expected_batch if itm.get("id")
+                    }
                     try:
                         result = fut.result()
                     except Exception as e:
                         logging.warning(f"Worker exception: {e}")
                         result = []
-                    # map back to texts
+                    processed_ids = set()
                     if result:
-                        write_results(result, original_map)
+                        processed_ids = write_results(result, original_map, expected_lookup)
                         lat = result[0].get("_latency", 0.0)
                         sum_latency += float(lat)
                         meta_batches += 1
-                futures.clear()
+                    missing_items = [item for item in expected_batch if item.get("id") not in processed_ids]
+                    if missing_items:
+                        skip_stats["missing_from_batch"] += len(missing_items)
+                        logging.warning(
+                            f"Model response missing {len(missing_items)} item(s); retrying individually."
+                        )
+                        handle_missing_items(missing_items)
+                pending_batches.clear()
+                process_recheck_futures()
 
                 elapsed = time.time() - start_time
                 rate = total / elapsed if elapsed > 0 else 0.0
@@ -564,17 +761,38 @@ def main():
         # tail batch
         tail = batcher.flush()
         if tail:
-            futures.append(ex.submit(deepseek_batch, tail))
+            submit_batch(ex, tail)
 
         # drain all
-        for fut in as_completed(futures):
+        for fut in as_completed(list(futures)):
+            futures.remove(fut)
+            expected_batch = pending_batches.pop(fut, [])
+            expected_lookup = {
+                itm.get("id"): itm.get("text", "") for itm in expected_batch if itm.get("id")
+            }
             try:
                 result = fut.result()
             except Exception as e:
                 logging.warning(f"Worker exception (tail): {e}")
                 result = []
+            processed_ids = set()
             if result:
-                write_results(result, original_map)
+                processed_ids = write_results(result, original_map, expected_lookup)
+            missing_items = [item for item in expected_batch if item.get("id") not in processed_ids]
+            if missing_items:
+                skip_stats["missing_from_batch"] += len(missing_items)
+                logging.warning(
+                    f"Tail drain missing {len(missing_items)} item(s); retrying individually."
+                )
+                handle_missing_items(missing_items)
+        pending_batches.clear()
+
+        dispatch_recheck(rex)
+        process_recheck_futures(done_only=False)
+
+    # process any remaining recheck futures after executors close
+    if recheck_futures:
+        process_recheck_futures(done_only=False)
 
     # final cache flush
     if cache_pairs:
@@ -587,6 +805,17 @@ def main():
 
     # split temps to final channel files
     split_to_final_files()
+
+    if skip_stats:
+        logging.info(
+            "⚠️ Skip stats: " + ", ".join(f"{k}={v}" for k, v in sorted(skip_stats.items()))
+        )
+
+    if recheck_stats:
+        logging.info(
+            "🔍 Recheck summary: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(recheck_stats.items()))
+        )
 
 if __name__ == "__main__":
     try:
