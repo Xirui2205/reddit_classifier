@@ -1,12 +1,11 @@
 import json
 import time
 import random
-import os
 import logging
 import hashlib
 import gzip
+import itertools
 import openai
-import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from queue import Queue
@@ -39,6 +38,7 @@ OUTPUT_DIR = Path("lang_split_out")
 TEMP_PREFIX = OUTPUT_DIR / "temp_results_part"
 CHECKPOINT_FILE = OUTPUT_DIR / "completed_ids.txt"
 LOG_FILE = OUTPUT_DIR / "classifier.log"
+SKIPPED_FILE = OUTPUT_DIR / "skipped.jsonl"
 
 MODEL = "deepseek-chat"
 MAX_WORKERS = 18
@@ -220,6 +220,25 @@ class AutoTuner:
 cache = {}
 done_ids = set()
 
+def iter_input_lines(path: Path):
+    """Yield non-empty lines from the input file, handling gzip transparently."""
+    path = Path(path)
+    if not path.exists():
+        logging.error(f"Input file not found: {path}")
+        return
+
+    opener = gzip.open if path.suffix == ".gz" else open
+    try:
+        with opener(path, "rt", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                yield line
+    except OSError as exc:
+        logging.error(f"Failed to read input file {path}: {exc}")
+
+
 def validate_checkpoint():
     """Safely handle resume logic — detect stale or incomplete checkpoints."""
     if not CHECKPOINT_FILE.exists():
@@ -227,14 +246,15 @@ def validate_checkpoint():
         return set()
 
     try:
-        done = set(open(CHECKPOINT_FILE, "r", encoding="utf-8").read().split())
-        total_lines = sum(1 for _ in open(INPUT_PATH, "r", encoding="utf-8"))
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as fh:
+            done = {line.strip() for line in fh if line.strip()}
+        total_lines = sum(1 for _ in iter_input_lines(INPUT_PATH))
         pct = (len(done) / total_lines) * 100 if total_lines else 0
 
         logging.info(f"Resuming with {len(done):,}/{total_lines:,} ({pct:.1f}%) comments already processed.")
 
         # ✅ If checkpoint seems too large or dataset changed → force partial restart
-        if len(done) >= total_lines:
+        if total_lines and len(done) >= total_lines:
             logging.warning("⚠️ Checkpoint indicates all lines processed — forcing full recheck of unclassified records.")
             return set()  # treat as fresh start, but keep old outputs
 
@@ -246,6 +266,23 @@ def validate_checkpoint():
     except Exception as e:
         logging.warning(f"⚠️ Checkpoint validation failed ({e}) — starting from scratch.")
         return set()
+
+
+def get_unprocessed_lines(path: Path, completed_ids):
+    """Stream lines that still need processing, skipping ones already in the checkpoint."""
+    for line in iter_input_lines(path):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            skip_stats["malformed_json"] += 1
+            continue
+
+        cid = rec.get("id") or rec.get("comment_id") or rec.get("post_id") or ""
+        cid = str(cid).strip()
+        if cid and cid in completed_ids:
+            continue
+
+        yield line
 
 
 writer_q = Queue()
@@ -265,7 +302,7 @@ def writer_thread():
             for r in recs:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
                 lines_in_part += 1
-                with open(CHECKPOINT_FILE, "a") as ckp:
+                with open(CHECKPOINT_FILE, "a", encoding="utf-8") as ckp:
                     ckp.write(r["id"] + "\n")
         if lines_in_part >= MAX_LINES_PER_PART:
             lines_in_part = 0
@@ -413,23 +450,178 @@ def deepseek_batch(batch):
 def main():
     start_time = time.time()
     total = 0
+    cumulative_tokens = 0
     batch, futures = [], []
     synthetic_counter = 0
 
     # ✅ Load and validate checkpoint
     done_ids = validate_checkpoint()
-    unprocessed = get_unprocessed_lines(INPUT_PATH, done_ids)
-    if not unprocessed:
-        logging.info("All records already processed — exiting cleanly.")
-        return
-
     tuner = AutoTuner(MAX_WORKERS, BATCH_SIZE)
     max_workers, batch_size = tuner.get_params()
-    total_lines = sum(1 for _ in open(INPUT_PATH, "r", encoding="utf-8"))
-    logging.info(f"Starting classification on {len(unprocessed):,} remaining comments out of {total_lines:,} total.")
+    total_lines = sum(1 for _ in iter_input_lines(INPUT_PATH))
+
+    line_iter = get_unprocessed_lines(INPUT_PATH, done_ids)
+    try:
+        first_line = next(line_iter)
+    except StopIteration:
+        logging.info("All records already processed — exiting cleanly.")
+        return
+    unprocessed = itertools.chain([first_line], line_iter)
+
+    remaining_estimate = max(total_lines - len(done_ids), 0)
+    logging.info(
+        f"Starting classification on ≈{remaining_estimate:,} remaining comments out of {total_lines:,} total."
+    )
 
     from collections import deque
     token_history = deque()
+
+    pending_batches = {}
+
+    def mark_skipped(records, reason):
+        if not records:
+            return 0
+        reason_key = f"skip_{reason}"
+        skip_stats[reason_key] += len(records)
+        logging.warning(
+            f"🧩 Skipping {len(records)} comment(s) due to {reason}."
+        )
+        with open(CHECKPOINT_FILE, "a", encoding="utf-8") as ckp, open(
+            SKIPPED_FILE, "a", encoding="utf-8"
+        ) as sf:
+            for item in records:
+                cid = str(item.get("id", "")).strip() or str(item.get("comment_id", "")).strip()
+                text = item.get("text", "")
+                if cid:
+                    done_ids.add(cid)
+                    ckp.write(cid + "\n")
+                sf.write(
+                    json.dumps(
+                        {
+                            "id": cid or item.get("id", ""),
+                            "text": text,
+                            "reason": reason,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        return len(records)
+
+    def drain_completed_futures():
+        nonlocal futures, pending_batches, total, max_workers, batch_size, token_history, cumulative_tokens
+        if not futures:
+            return
+
+        meta_batches = 0
+        sum_latency = 0.0
+        for fut in as_completed(list(futures)):
+            try:
+                result = fut.result()
+            except Exception as e:
+                logging.warning(f"⚠️ Worker future raised exception: {e}")
+                result = []
+
+            original_batch = pending_batches.pop(fut, [])
+
+            # --- handle empty/failed batch ---
+            if not result:
+                skip_stats["empty_batch"] += 1
+                logging.warning("⚠️ Empty batch returned — retrying in smaller chunks.")
+                failed_records = []
+                try:
+                    for i in range(0, len(original_batch), 10):
+                        sub = original_batch[i:i+10]
+                        sub_result = deepseek_batch(sub)
+                        if sub_result:
+                            sub_map = {item["id"]: item["text"] for item in sub}
+                            for r in sub_result:
+                                cid = r.get("id")
+                                if "text" not in r or not r["text"]:
+                                    r["text"] = sub_map.get(cid, "")
+                                r.pop("_latency", None)
+                                r.pop("_tokens", None)
+                                r.pop("_batch", None)
+                            writer_q.put(sub_result)
+                            for r in sub_result:
+                                text_val = r.get("text", "")
+                                if text_val:
+                                    cache[hash_text(text_val)] = r.get("language", "")
+                                rid = str(r.get("id", "")).strip()
+                                if rid:
+                                    done_ids.add(rid)
+                            total += len(sub_result)
+                        else:
+                            failed_records.extend(sub)
+                    continue
+                except Exception as retry_err:
+                    logging.warning(f"⚠️ Retry of empty batch failed: {retry_err}")
+                    failed_records = list(original_batch)
+                if failed_records:
+                    total += mark_skipped(failed_records, "deepseek_failure")
+                continue
+
+            # --- normal successful batch handling ---
+            lat = result[0].get("_latency", 0.0)
+            toks = result[0].get("_tokens", 0)
+            meta_batches += 1
+            sum_latency += float(lat)
+            cumulative_tokens += int(toks)
+
+            id_to_text = {item["id"]: item["text"] for item in original_batch}
+
+            for r in result:
+                cid = r["id"]
+                orig = id_to_text.get(cid, "")
+                if "text" not in r or not r["text"]:
+                    r["text"] = orig
+                r.pop("_latency", None)
+                r.pop("_tokens", None)
+                r.pop("_batch", None)
+
+            writer_q.put(result)
+            for r in result:
+                cache[hash_text(r["text"])] = r.get("language", "")
+                rid = str(r.get("id", "")).strip()
+                if rid:
+                    done_ids.add(rid)
+            total += len(result)
+
+            # --- tune dynamically ---
+            elapsed = time.time() - start_time
+            rate = total / elapsed if elapsed > 0 else 0.0
+            avg_latency = (sum_latency / meta_batches) if meta_batches else 0.0
+            token_rate = (cumulative_tokens / elapsed) if elapsed > 0 else 0.0
+            tuner.adjust(True, rate=rate, total=total,
+                         token_rate=token_rate, avg_latency=avg_latency)
+
+        futures.clear()
+        max_workers, batch_size = tuner.get_params()
+
+        # --- progress logging ---
+        elapsed = time.time() - start_time
+        rate = total / elapsed if elapsed > 0 else 0.0
+        avg_latency = (sum_latency / meta_batches) if meta_batches else 0.0
+        token_rate = (cumulative_tokens / elapsed) if elapsed > 0 else 0.0
+        eta = (total_lines - total) / rate / 3600 if rate > 0 else 0.0
+        logging.info(
+            f"✅ Progress: {total:,}/{total_lines:,} processed "
+            f"({rate:.1f}/s, {int(token_rate)} tok/s, avg_lat {avg_latency:.2f}s) "
+            f"| ETA ≈ {eta:.2f}h | batch={batch_size}, workers={max_workers}"
+        )
+
+        # --- 30-min moving-average token/s ---
+        now_ts = time.time()
+        token_history.append((now_ts, cumulative_tokens))
+        while token_history and now_ts - token_history[0][0] > 1800:
+            token_history.popleft()
+        if len(token_history) > 1:
+            old_time, old_tokens = token_history[0]
+            window_tokens = cumulative_tokens - old_tokens
+            window_time = now_ts - old_time
+            if window_time > 0:
+                moving_avg_tok_s = window_tokens / window_time
+                logging.info(f"⚡ 30-min moving-avg token/s: {moving_avg_tok_s:,.0f}")
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         for line in unprocessed:
@@ -458,120 +650,48 @@ def main():
 
             # --- flush batch early if token count too high ---
             if sum(estimate_tokens(b["text"]) for b in batch) > 7000:
-                futures.append(executor.submit(deepseek_batch, batch))
+                payload = [dict(item) for item in batch]
+                fut = executor.submit(deepseek_batch, payload)
+                futures.append(fut)
+                pending_batches[fut] = payload
                 batch = []
 
             # --- normal batch-size flush ---
             if len(batch) >= batch_size:
-                futures.append(executor.submit(deepseek_batch, batch))
+                payload = [dict(item) for item in batch]
+                fut = executor.submit(deepseek_batch, payload)
+                futures.append(fut)
+                pending_batches[fut] = payload
                 batch = []
 
             # ---- drain futures when queue is full ----
             if len(futures) >= max_workers * 2:
-                meta_batches = 0
-                sum_latency = 0.0
-                sum_tokens = 0
-                sum_items = 0
+                drain_completed_futures()
 
-                for fut in as_completed(futures):
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        logging.warning(f"⚠️ Worker future raised exception: {e}")
-                        result = []
-
-                    # --- handle empty/failed batch ---
-                    if not result:
-                        skip_stats["empty_batch"] += 1
-                        logging.warning("⚠️ Empty batch returned — retrying in smaller chunks.")
-                        try:
-                            for i in range(0, len(batch), 10):
-                                sub = batch[i:i+10]
-                                sub_result = deepseek_batch(sub)
-                                if sub_result:
-                                    writer_q.put(sub_result)
-                                    for r in sub_result:
-                                        cache[hash_text(r["text"])] = r.get("language", "")
-                                    total += len(sub_result)
-                            continue
-                        except Exception as retry_err:
-                            logging.warning(f"⚠️ Retry of empty batch failed: {retry_err}")
-                            continue
-
-                    # --- normal successful batch handling ---
-                    lat = result[0].get("_latency", 0.0)
-                    toks = result[0].get("_tokens", 0)
-                    bsz = result[0].get("_batch", len(result))
-                    meta_batches += 1
-                    sum_latency += float(lat)
-                    sum_tokens += int(toks)
-                    sum_items += int(bsz)
-
-                    for r in result:
-                        cid = r["id"]
-                        orig = next((b["text"] for b in batch if b["id"] == cid), "")
-                        if "text" not in r or not r["text"]:
-                            r["text"] = orig
-                        r.pop("_latency", None)
-                        r.pop("_tokens", None)
-                        r.pop("_batch", None)
-
-                    writer_q.put(result)
-                    for r in result:
-                        cache[hash_text(r["text"])] = r.get("language", "")
-                    total += len(result)
-                    success = True
-
-                    # --- tune dynamically ---
-                    elapsed = time.time() - start_time
-                    rate = total / elapsed if elapsed > 0 else 0.0
-                    avg_latency = (sum_latency / meta_batches) if meta_batches else 0.0
-                    token_rate = (sum_tokens / elapsed) if elapsed > 0 else 0.0
-                    tuner.adjust(success, rate=rate, total=total,
-                                 token_rate=token_rate, avg_latency=avg_latency)
-
-                futures.clear()
-                max_workers, batch_size = tuner.get_params()
-
-                # --- progress logging ---
-                elapsed = time.time() - start_time
-                rate = total / elapsed if elapsed > 0 else 0.0
-                avg_latency = (sum_latency / meta_batches) if meta_batches else 0.0
-                token_rate = (sum_tokens / elapsed) if elapsed > 0 else 0.0
-                eta = (total_lines - total) / rate / 3600 if rate > 0 else 0.0
-                logging.info(
-                    f"✅ Progress: {total:,}/{total_lines:,} processed "
-                    f"({rate:.1f}/s, {int(token_rate)} tok/s, avg_lat {avg_latency:.2f}s) "
-                    f"| ETA ≈ {eta:.2f}h | batch={batch_size}, workers={max_workers}"
-                )
-
-                # --- 30-min moving-average token/s ---
-                now_ts = time.time()
-                token_history.append((now_ts, sum_tokens))
-                while token_history and now_ts - token_history[0][0] > 1800:
-                    token_history.popleft()
-                if len(token_history) > 1:
-                    old_time, old_tokens = token_history[0]
-                    window_tokens = sum_tokens - old_tokens
-                    window_time = now_ts - old_time
-                    if window_time > 0:
-                        moving_avg_tok_s = window_tokens / window_time
-                        logging.info(f"⚡ 30-min moving-avg token/s: {moving_avg_tok_s:,.0f}")
+        # Drain any remaining futures after input exhaustion
+        drain_completed_futures()
 
     # ---- tail batch ----
     if batch:
         result = deepseek_batch(batch)
         if result:
+            id_to_text = {item["id"]: item["text"] for item in batch}
             for r in result:
                 cid = r["id"]
-                orig = next((b["text"] for b in batch if b["id"] == cid), "")
+                orig = id_to_text.get(cid, "")
                 if "text" not in r or not r["text"]:
                     r["text"] = orig
                 r.pop("_latency", None)
                 r.pop("_tokens", None)
                 r.pop("_batch", None)
             writer_q.put(result)
+            for r in result:
+                rid = str(r.get("id", "")).strip()
+                if rid:
+                    done_ids.add(rid)
             total += len(result)
+        else:
+            total += mark_skipped(batch, "deepseek_failure")
 
     writer_q.put(None)
     elapsed = time.time() - start_time
@@ -617,3 +737,7 @@ def main():
             logging.info(f"   {reason:<18}: {count:,}")
     else:
         logging.info("🧩 No comments were skipped due to filters or parse errors.")
+
+
+if __name__ == "__main__":
+    main()
