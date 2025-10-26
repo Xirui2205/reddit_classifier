@@ -38,6 +38,7 @@ OUTPUT_DIR = Path("lang_split_out")
 TEMP_PREFIX = OUTPUT_DIR / "temp_results_part"
 CHECKPOINT_FILE = OUTPUT_DIR / "completed_ids.txt"
 LOG_FILE = OUTPUT_DIR / "classifier.log"
+SKIPPED_FILE = OUTPUT_DIR / "skipped.jsonl"
 
 MODEL = "deepseek-chat"
 MAX_WORKERS = 18
