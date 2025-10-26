@@ -47,13 +47,8 @@ ORIGINAL_MAP_LIMIT = 20_000      # cap stored originals for alignment
 
 # ---------------- API KEY/BASE ----------------
 import openai
-API_KEY = "sk-33a98b12f11f4300857e5ca93bf90e24"
-API_BASE = "https://api.deepseek.com"
-#openai.api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-#openai.api_base = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com").strip()
-
-if not openai.api_key:
-    raise SystemExit("Missing DEEPSEEK_API_KEY env var")
+openai.api_key = "sk-33a98b12f11f4300857e5ca93bf90e24"
+openai.api_base = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com").strip()
 
 # ---------------- LOGGING ----------------
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
