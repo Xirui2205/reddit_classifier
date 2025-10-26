@@ -316,10 +316,18 @@ Thread(target=writer_thread, daemon=True).start()
 
 # ---------------- UTILITIES ----------------
 def safe_text_check(text):
-    if not text.strip():
+    """Basic sanity check to ensure we have real content to classify."""
+    if text is None:
         return False
-    if '"' not in text and "'" not in text:
+
+    cleaned = text.strip()
+    if not cleaned:
         return False
+
+    # Filter out extremely short artefacts that tend to be noise or markup.
+    if len(cleaned) < 3:
+        return False
+
     return True
 
 
