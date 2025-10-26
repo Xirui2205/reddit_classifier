@@ -486,36 +486,6 @@ def main():
 
     pending_batches = {}
 
-    def mark_skipped(records, reason):
-        if not records:
-            return 0
-        reason_key = f"skip_{reason}"
-        skip_stats[reason_key] += len(records)
-        logging.warning(
-            f"🧩 Skipping {len(records)} comment(s) due to {reason}."
-        )
-        with open(CHECKPOINT_FILE, "a", encoding="utf-8") as ckp, open(
-            SKIPPED_FILE, "a", encoding="utf-8"
-        ) as sf:
-            for item in records:
-                cid = str(item.get("id", "")).strip() or str(item.get("comment_id", "")).strip()
-                text = item.get("text", "")
-                if cid:
-                    done_ids.add(cid)
-                    ckp.write(cid + "\n")
-                sf.write(
-                    json.dumps(
-                        {
-                            "id": cid or item.get("id", ""),
-                            "text": text,
-                            "reason": reason,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-        return len(records)
-
     def drain_completed_futures():
         nonlocal futures, pending_batches, total, max_workers, batch_size, token_history, cumulative_tokens
         if not futures:
@@ -536,37 +506,21 @@ def main():
             if not result:
                 skip_stats["empty_batch"] += 1
                 logging.warning("⚠️ Empty batch returned — retrying in smaller chunks.")
-                failed_records = []
                 try:
                     for i in range(0, len(original_batch), 10):
                         sub = original_batch[i:i+10]
                         sub_result = deepseek_batch(sub)
                         if sub_result:
-                            sub_map = {item["id"]: item["text"] for item in sub}
-                            for r in sub_result:
-                                cid = r.get("id")
-                                if "text" not in r or not r["text"]:
-                                    r["text"] = sub_map.get(cid, "")
-                                r.pop("_latency", None)
-                                r.pop("_tokens", None)
-                                r.pop("_batch", None)
                             writer_q.put(sub_result)
                             for r in sub_result:
-                                text_val = r.get("text", "")
-                                if text_val:
-                                    cache[hash_text(text_val)] = r.get("language", "")
+                                cache[hash_text(r["text"])] = r.get("language", "")
                                 rid = str(r.get("id", "")).strip()
                                 if rid:
                                     done_ids.add(rid)
                             total += len(sub_result)
-                        else:
-                            failed_records.extend(sub)
                     continue
                 except Exception as retry_err:
                     logging.warning(f"⚠️ Retry of empty batch failed: {retry_err}")
-                    failed_records = list(original_batch)
-                if failed_records:
-                    total += mark_skipped(failed_records, "deepseek_failure")
                 continue
 
             # --- normal successful batch handling ---
@@ -698,8 +652,6 @@ def main():
                 if rid:
                     done_ids.add(rid)
             total += len(result)
-        else:
-            total += mark_skipped(batch, "deepseek_failure")
 
     writer_q.put(None)
     elapsed = time.time() - start_time
