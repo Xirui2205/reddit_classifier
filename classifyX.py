@@ -15,6 +15,8 @@ import sqlite3
 import logging
 import hashlib
 import argparse
+from dataclasses import dataclass
+from typing import Optional
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, deque, OrderedDict
@@ -79,6 +81,7 @@ except Exception:
 # ---------------- SKIP COUNTERS ----------------
 skip_stats = Counter()
 heuristic_usage = Counter()
+heuristic_confidence_accum = 0.0
 
 # ---------------- SQLITE PERSISTENT CACHE ----------------
 def init_cache_db(path: Path):
@@ -227,30 +230,56 @@ def get_unprocessed_lines(path: str, already_done_ids: set):
 
 # ---------------- HEURISTIC PRE-CLASSIFIER ----------------
 # Fast pass to skip obvious cases (saves cost; keeps DeepSeek for ambiguous/Sheng)
-SWAHILI_COMMON = set("""
-na ya kwa ni sana bado bila kama ndio haya wewe sisi wapi leo jana kesho hivyo yake yetu wao wao
-mimi wewe yeye huku pale ndani nje sasa pia kutu kitu vitu wakati wakati mwingine kwa sababu shukrani
-""".split())
+SWAHILI_COMMON = set(
+    """
+    na ya kwa ni sana bado bila kama ndio haya wewe sisi wapi leo jana kesho hivyo yake yetu wao wao
+    mimi wewe yeye huku pale ndani nje sasa pia kutu kitu vitu wakati wakati mwingine kwa sababu shukrani
+    watu mungu nchi wakati kila baada yake kama vile kutoka kwamba kupata kuenda maana mbele karibu
+    """.split()
+)
 
-SHENG_HINTS = set("""
-ndo msee buda wasee niko aje nikoarea nashida manze manzee dem mresh sherehe mtaa kejani nduthi
-mbogi form ng'ara mafta gari jobo wacha bro brathe sheng
-""".split())
+ENGLISH_COMMON = set(
+    """
+    the and you your from have this that what when where will they them then here there with about much people
+    which because would could should know just like into only over very even never still those being after before
+    """.split()
+)
 
-SHENG_STRONG_RE = re.compile(r"manz+e|msee|nduthi")
-SWAHILI_SUFFIX_RE = re.compile(r"(ni|wa|me|sha)$")
-SWAHILI_SECONDARY_RE = re.compile(r"\b(ni|wa|me|sha)\b")
-ENGLISH_CUE_RE = re.compile(r"(th|sh|ing|tion|ough)")
+SHENG_HINTS = set(
+    """
+    ndo msee buda wasee niko aje nikoarea nashida manze manzee manzee dem mresh sherehe mtaa kejani nduthi
+    mbogi form ng'ara mafta gari jobo wacha bro brathe sheng mtoi tao keja madem mabeste omosh
+    """.split()
+)
+
+SHENG_STRONG_RE = re.compile(r"manz+e|msee|nduthi|mbogi|mtaa|mresh")
+SWAHILI_SUFFIX_RE = re.compile(r"(ni|wa|me|sha|ku|tu|ke)$")
+SWAHILI_PREFIX_RE = re.compile(r"^(ku|kwa|wa|ni|si|hu|tu|m|u|a)")
+SWAHILI_TENSE_RE = re.compile(r"^(ni|si|hu|wa|tu|m|u|a)?(na|me|ta|li|ku|ki|nge|sha)")
+SWAHILI_SECONDARY_RE = re.compile(r"\b(ni|wa|me|sha|tuko|mimi|sisi|wetu)\b")
+SWAHILI_CHAR_RE = re.compile(r"(ng'|ny|mb|nd|mw|ch|sh)")
+ENGLISH_CUE_RE = re.compile(r"(th|sh|ing|tion|ough|ight|ment|ness|ever|est|ous)")
+ENGLISH_SUFFIX_RE = re.compile(r"(ing|ers?|ed|tion|ments?|ness|ity|ous|able|ively|less)$")
 DOUBLE_VOWEL_RE = re.compile(r"([aeiou])\1")
+SHENG_EXTRA_RE = re.compile(r"(maze|brathe|msoo|msupa|demi|kuflip|op|wuod)")
 
 BASE_HEURISTIC_THRESHOLDS = {
-    "sheng_ratio": 0.18,
-    "swahili_ratio": 0.22,
+    "sheng_ratio": 0.20,
+    "swahili_ratio": 0.24,
     "english_ratio": 0.55,
     "mixed_low": 0.16,
-    "mixed_gate": 0.28,
+    "mixed_gate": 0.30,
     "english_ascii": 0.78,
 }
+
+
+@dataclass
+class HeuristicDecision:
+    label: str
+    confidence: float
+    scores: dict
+    features: dict
+    reason: str
 
 
 class AdaptiveHeuristicTuner:
@@ -259,14 +288,18 @@ class AdaptiveHeuristicTuner:
         self.thresholds = dict(base_thresholds)
         self.recheck_prob = base_recheck_prob
         self.window = deque(maxlen=25)
+        self.conf_window = deque(maxlen=25)
         self.min_samples = 15
         self.last_adjust = 0.0
 
-    def record_batch(self, matches: int, mismatches: int):
+    def record_batch(self, matches: int, mismatches: int, avg_confidence: Optional[float] = None):
         total = matches + mismatches
         if total <= 0:
             return
         self.window.append((mismatches, total))
+        if avg_confidence is not None:
+            self.conf_window.append(avg_confidence)
+            logging.info(f"🔍 Heuristic sample avg_conf={avg_confidence:.2f}")
         rate = mismatches / total
         logging.info(
             f"🔁 Heuristic sample confusion: mismatch_rate={rate:.1%} ({mismatches}/{total})"
@@ -281,6 +314,11 @@ class AdaptiveHeuristicTuner:
         total = sum(t for _, t in self.window)
         return mism, total
 
+    def _window_confidence(self):
+        if not self.conf_window:
+            return None
+        return sum(self.conf_window) / len(self.conf_window)
+
     def _maybe_adjust(self):
         mism, total = self._window_totals()
         if total < self.min_samples:
@@ -293,8 +331,9 @@ class AdaptiveHeuristicTuner:
             self._loosen(rate)
 
     def _tighten(self, rate: float):
+        conf = self._window_confidence() or 0.0
         self.thresholds["sheng_ratio"] = min(
-            self.thresholds["sheng_ratio"] + 0.02, self.base_thresholds["sheng_ratio"] + 0.16
+            self.thresholds["sheng_ratio"] + 0.02, self.base_thresholds["sheng_ratio"] + 0.18
         )
         self.thresholds["swahili_ratio"] = min(
             self.thresholds["swahili_ratio"] + 0.02, self.base_thresholds["swahili_ratio"] + 0.18
@@ -303,17 +342,19 @@ class AdaptiveHeuristicTuner:
             self.thresholds["english_ratio"] + 0.03, 0.92
         )
         self.thresholds["mixed_gate"] = min(
-            self.thresholds["mixed_gate"] + 0.02, 0.5
+            self.thresholds["mixed_gate"] + 0.02, 0.52
         )
-        self.recheck_prob = min(self.recheck_prob + 0.03, 0.4)
+        prob_step = 0.02 if conf < 0.45 else 0.04
+        self.recheck_prob = min(self.recheck_prob + prob_step, 0.5)
         self.last_adjust = time.time()
         logging.warning(
-            "⚠️ Heuristic drift high (rate={:.1%}); tightening thresholds and increasing recheck sampling to {:.0%}.".format(
-                rate, self.recheck_prob
+            "⚠️ Heuristic drift high (rate={:.1%}, avg_conf={:.2f}); tightening thresholds and increasing recheck sampling to {:.0%}.".format(
+                rate, conf, self.recheck_prob
             )
         )
 
     def _loosen(self, rate: float):
+        conf = self._window_confidence() or 0.0
         self.thresholds["sheng_ratio"] = max(
             self.base_thresholds["sheng_ratio"], self.thresholds["sheng_ratio"] - 0.01
         )
@@ -326,11 +367,12 @@ class AdaptiveHeuristicTuner:
         self.thresholds["mixed_gate"] = max(
             self.base_thresholds["mixed_gate"], self.thresholds["mixed_gate"] - 0.01
         )
-        self.recheck_prob = max(RECHECK_PROB_HEURISTIC, self.recheck_prob - 0.02)
+        decay = 0.01 if conf > 0.55 else 0.02
+        self.recheck_prob = max(RECHECK_PROB_HEURISTIC, self.recheck_prob - decay)
         self.last_adjust = time.time()
         logging.info(
-            "✅ Heuristic drift low (rate={:.1%}); relaxing thresholds and recheck sampling to {:.0%}.".format(
-                rate, self.recheck_prob
+            "✅ Heuristic drift low (rate={:.1%}, avg_conf={:.2f}); relaxing thresholds and recheck sampling to {:.0%}.".format(
+                rate, conf, self.recheck_prob
             )
         )
 
@@ -338,72 +380,182 @@ class AdaptiveHeuristicTuner:
 heuristic_tuner = AdaptiveHeuristicTuner(BASE_HEURISTIC_THRESHOLDS, RECHECK_PROB_HEURISTIC)
 
 
-def heuristic_label(text: str):
+def _tokenize_for_heuristic(text: str):
+    return re.findall(r"[a-zA-Z']+", text)
+
+
+def heuristic_decision(text: str) -> Optional[HeuristicDecision]:
     t = (text or "").lower()
     if not t:
         return None
-    # crude filters
+
     letters = sum(ch.isalpha() for ch in t)
     if letters < 3:
         return None
 
-    tokens = re.findall(r"[a-zA-Z']+", t)
+    tokens = _tokenize_for_heuristic(t)
     if not tokens:
         return None
 
     total_tokens = len(tokens)
+    if total_tokens < 2:
+        return None
+
     unique_tokens = set(tokens)
     ascii_tokens = sum(1 for tok in tokens if tok.isascii())
+    non_ascii_chars = sum(1 for ch in text if ord(ch) > 127)
+    digit_chars = sum(1 for ch in text if ch.isdigit())
 
     sw_hits = sum(1 for w in unique_tokens if w in SWAHILI_COMMON)
     sh_hits = sum(1 for w in unique_tokens if w in SHENG_HINTS)
+    en_hits = sum(1 for w in unique_tokens if w in ENGLISH_COMMON)
 
     sw_suffix_hits = sum(1 for tok in tokens if SWAHILI_SUFFIX_RE.search(tok))
+    sw_prefix_hits = sum(1 for tok in tokens if SWAHILI_PREFIX_RE.match(tok))
+    sw_tense_hits = sum(1 for tok in tokens if SWAHILI_TENSE_RE.match(tok))
+    sw_char_hits = sum(1 for tok in tokens if SWAHILI_CHAR_RE.search(tok))
     sh_double_hits = sum(1 for tok in tokens if DOUBLE_VOWEL_RE.search(tok))
+    sh_extra_hits = sum(1 for tok in tokens if SHENG_EXTRA_RE.search(tok))
     english_cues = sum(1 for tok in tokens if ENGLISH_CUE_RE.search(tok))
+    english_suffix_hits = sum(1 for tok in tokens if ENGLISH_SUFFIX_RE.search(tok))
 
-    if SHENG_STRONG_RE.search(t):
-        return "Sheng"
+    strong_sheng = 1 if SHENG_STRONG_RE.search(t) else 0
+    sw_secondary = 1 if SWAHILI_SECONDARY_RE.search(t) else 0
+
+    sw_ratio = (
+        sw_hits
+        + 0.6 * sw_suffix_hits
+        + 0.5 * sw_prefix_hits
+        + 0.4 * sw_tense_hits
+        + 0.3 * sw_char_hits
+    ) / total_tokens
+    if sw_secondary:
+        sw_ratio += 0.04
+
+    sh_ratio = (
+        1.2 * sh_hits
+        + 0.8 * sh_double_hits
+        + 0.6 * sh_extra_hits
+        + (1.8 if strong_sheng else 0.0)
+    ) / total_tokens
+
+    eng_ratio = (
+        1.0 * en_hits
+        + 0.7 * english_suffix_hits
+        + 0.5 * english_cues
+        + 0.35 * ascii_tokens
+    ) / total_tokens
+
+    ascii_ratio = ascii_tokens / total_tokens
+    mixed_signal = min(sw_ratio, eng_ratio)
+
+    features = {
+        "total_tokens": total_tokens,
+        "sw_ratio": sw_ratio,
+        "sw_affix_ratio": (sw_suffix_hits + sw_prefix_hits + sw_tense_hits) / total_tokens,
+        "sw_char_ratio": sw_char_hits / total_tokens,
+        "sheng_ratio": sh_ratio,
+        "sheng_double_ratio": sh_double_hits / total_tokens,
+        "sheng_regex": strong_sheng,
+        "english_ratio": eng_ratio,
+        "english_suffix_ratio": english_suffix_hits / total_tokens,
+        "english_char_ratio": english_cues / total_tokens,
+        "ascii_ratio": ascii_ratio,
+        "non_ascii_ratio": non_ascii_chars / max(1, len(text)),
+        "digit_ratio": digit_chars / max(1, len(text)),
+    }
 
     thresholds = heuristic_tuner.thresholds
 
-    sw_ratio = (sw_hits + 0.6 * sw_suffix_hits) / total_tokens
-    if SWAHILI_SECONDARY_RE.search(t):
-        sw_ratio += 0.05
-    sh_ratio = (sh_hits + 0.7 * sh_double_hits) / total_tokens
-    eng_ratio = (english_cues + 0.4 * ascii_tokens) / total_tokens
-    eng_ratio = min(1.0, eng_ratio)
-    ascii_ratio = ascii_tokens / total_tokens
+    scores = {
+        "Sheng": sh_ratio,
+        "Swahili": sw_ratio,
+        "English": eng_ratio,
+        "English and Swahili": mixed_signal,
+    }
 
-    if sh_ratio >= thresholds["sheng_ratio"] or sh_hits >= 2:
-        return "Sheng"
+    # Determine label with layered checks
+    reason_parts = []
+    label = None
 
-    if sw_ratio >= thresholds["swahili_ratio"] and sh_ratio < thresholds["sheng_ratio"]:
-        return "Swahili"
+    if strong_sheng and sh_ratio >= thresholds["sheng_ratio"] * 0.5:
+        label = "Sheng"
+        reason_parts.append("strong_sheng_regex")
 
-    if eng_ratio >= thresholds["english_ratio"] and sw_ratio < thresholds["mixed_gate"]:
-        return "English"
+    if label is None and sh_ratio >= thresholds["sheng_ratio"]:
+        label = "Sheng"
+        reason_parts.append(f"sheng_ratio={sh_ratio:.2f}")
 
-    if sw_ratio >= thresholds["mixed_low"] and eng_ratio >= thresholds["mixed_low"]:
-        return "English and Swahili"
+    if label is None and sw_ratio >= thresholds["swahili_ratio"] and sh_ratio < thresholds["sheng_ratio"] * 0.85:
+        label = "Swahili"
+        reason_parts.append(f"sw_ratio={sw_ratio:.2f}")
 
-    if ascii_ratio >= thresholds["english_ascii"] and sw_hits == 0 and sh_hits == 0:
-        return "English"
+    if label is None and eng_ratio >= thresholds["english_ratio"] and sw_ratio < thresholds["mixed_gate"]:
+        label = "English"
+        reason_parts.append(f"eng_ratio={eng_ratio:.2f}")
 
-    if sh_hits == 1 and sh_ratio >= (thresholds["sheng_ratio"] * 0.75):
-        return "Sheng"
+    if label is None and sw_ratio >= thresholds["mixed_low"] and eng_ratio >= thresholds["mixed_low"]:
+        label = "English and Swahili"
+        reason_parts.append(f"mixed sw={sw_ratio:.2f} en={eng_ratio:.2f}")
 
-    return None
+    if label is None and ascii_ratio >= thresholds["english_ascii"] and sw_hits == 0 and sh_hits == 0:
+        label = "English"
+        reason_parts.append("ascii_dominant")
+
+    if label is None and sh_hits >= 1 and sh_ratio >= thresholds["sheng_ratio"] * 0.75:
+        label = "Sheng"
+        reason_parts.append("sheng_single_hit")
+
+    # compute confidence & fallback heuristics when uncertain or noisy
+    ordered_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_score = ordered_scores[0][1] if ordered_scores else 0.0
+    second_score = ordered_scores[1][1] if len(ordered_scores) > 1 else 0.0
+    margin = max(0.0, best_score - second_score)
+    confidence = max(0.0, min(1.0, best_score + 0.5 * margin))
+
+    if label is None and confidence >= 0.58:
+        label = ordered_scores[0][0]
+        reason_parts.append("auto_high_score")
+
+    if label is not None and confidence < 0.18:
+        # too shaky to trust
+        label = None
+
+    if label is not None and features["non_ascii_ratio"] > 0.12:
+        label = None
+
+    if label is not None and features["digit_ratio"] > 0.18:
+        label = None
+
+    degrade_gate = heuristic_tuner.recheck_prob >= 0.3
+    if label is not None and degrade_gate and confidence < 0.45:
+        label = None
+
+    if label is None:
+        return None
+
+    reason = ",".join(reason_parts) if reason_parts else "signal"
+    return HeuristicDecision(label=label, confidence=confidence, scores=scores, features=features, reason=reason)
+
+
+def heuristic_label(text: str):
+    decision = heuristic_decision(text)
+    return decision.label if decision else None
 
 # ---------------- PROMPTS (JSON-LINES format) ----------------
 SYSTEM_PROMPT = (
-    "You are an expert linguist trained to classify Kenyan Reddit comments by language type.\n"
-    "For EACH input line (a single JSON object with fields {id, text}), output ONE JSON line with exactly:\n"
-    "{\"id\":\"...\",\"language\":\"<one of: Swahili | English and Swahili | Sheng | English>\"}\n"
-    "CRITICAL:\n"
-    "- Output JSON lines only, one per input line, same order, no markdown, no commentary.\n"
-    "- Always pick exactly one label per id.\n"
-    "- If uncertain between 'Sheng' and 'English and Swahili', prefer 'Sheng' when slangy/informal.\n"
+    "You are an expert Kenyan linguist who classifies Reddit comments by language variety.\n"
+    "Label definitions:\n"
+    "- 'Swahili': standard Swahili vocabulary or grammar with minimal English mixing.\n"
+    "- 'English and Swahili': clear code-mixing of both languages without heavy Sheng slang.\n"
+    "- 'Sheng': Nairobi urban slang, youthful tone, or heavy Swahili-English blending with slangy spellings.\n"
+    "- 'English': plain English (allowing occasional Swahili interjections that do not change the dominant language).\n"
+    "Instructions:\n"
+    "- Each input line is a JSON object with fields {id, text}; respond with ONE JSON line {\"id\":...,\"language\":...}.\n"
+    "- Preserve order, emit no explanations, markdown, or blank lines.\n"
+    "- Always choose exactly one label. If text is slangy but intelligible, prefer 'Sheng'.\n"
+    "- Treat obvious metadata, URLs, or emojis as neutral context and classify by the surrounding language.\n"
+    "- When English and Swahili are balanced but formal, choose 'English and Swahili'; when slang dominates, choose 'Sheng'.\n"
 )
 
 def make_user_block(batch):
@@ -626,6 +778,7 @@ def split_to_final_files():
     logging.info(f"📁 Split files in: {OUTPUT_DIR.absolute()}")
 
 def main():
+    global heuristic_confidence_accum
     start_time = time.time()
     done_ids = validate_checkpoint()
     stream = get_unprocessed_lines(INPUT_PATH, done_ids)
@@ -731,7 +884,7 @@ def main():
         recheck_futures.append((future, meta))
         recheck_buffer = []
 
-    def schedule_recheck(executor, item_id, text, expected, h, source):
+    def schedule_recheck(executor, item_id, text, expected, h, source, diagnostics=None):
         nonlocal recheck_seq
         recheck_seq += 1
         re_id = f"recheck::{item_id}::{recheck_seq}"
@@ -743,6 +896,7 @@ def main():
                 "expected": expected,
                 "hash": h,
                 "source": source,
+                "diagnostics": diagnostics or {},
             }
         )
         if len(recheck_buffer) >= RECHECK_BATCH_SIZE:
@@ -765,6 +919,8 @@ def main():
                 continue
             seen = set()
             batch_counts = Counter()
+            confidence_total = 0.0
+            confidence_n = 0
             for obj in results or []:
                 rid = obj.get("id")
                 lang = obj.get("language")
@@ -775,14 +931,45 @@ def main():
                 expected = item.get("expected")
                 if not lang:
                     continue
+                diag = item.get("diagnostics") or {}
+                bucket = diag.get("bucket")
+                if bucket:
+                    recheck_stats[f"{item['source']}_{bucket}_seen"] += 1
+                conf_val = diag.get("confidence")
+                if item["source"] == "heuristic" and isinstance(conf_val, (int, float)):
+                    confidence_total += float(conf_val)
+                    confidence_n += 1
                 if lang != expected:
                     recheck_stats["mismatch"] += 1
                     recheck_stats[f"{item['source']}_mismatch"] += 1
                     batch_counts[f"{item['source']}_mismatch"] += 1
-                    logging.warning(
+                    if bucket:
+                        recheck_stats[f"{item['source']}_{bucket}_mismatch"] += 1
+                    details = []
+                    reason = diag.get("reason")
+                    if reason:
+                        details.append(f"reason={reason}")
+                    if isinstance(conf_val, (int, float)):
+                        details.append(f"conf={float(conf_val):.2f}")
+                    scores_excerpt = diag.get("scores") or {}
+                    if scores_excerpt:
+                        top_scores = sorted(scores_excerpt.items(), key=lambda kv: kv[1], reverse=True)[:3]
+                        details.append(
+                            "scores=" + ",".join(f"{k}:{v:.2f}" for k, v in top_scores)
+                        )
+                    feat_excerpt = diag.get("features") or {}
+                    if feat_excerpt:
+                        top_feats = ",".join(
+                            f"{k}:{feat_excerpt[k]:.2f}" for k in sorted(feat_excerpt)[:3]
+                        )
+                        details.append("features=" + top_feats)
+                    msg = (
                         f"Recheck drift detected for {item['original_id']} ({item['source']}): "
                         f"expected {expected}, got {lang}."
                     )
+                    if details:
+                        msg += " [" + "; ".join(details) + "]"
+                    logging.warning(msg)
                     h = item.get("hash")
                     if h:
                         cache_delete(h)
@@ -796,17 +983,24 @@ def main():
                     recheck_stats["match"] += 1
                     recheck_stats[f"{item['source']}_match"] += 1
                     batch_counts[f"{item['source']}_match"] += 1
+                    if bucket:
+                        recheck_stats[f"{item['source']}_{bucket}_match"] += 1
             missing = set(meta.keys()) - seen
             for rid in missing:
                 item = meta[rid]
+                diag = item.get("diagnostics") or {}
+                bucket = diag.get("bucket")
                 logging.warning(
                     f"Recheck returned no result for {item['original_id']} ({item['source']})."
                 )
                 recheck_stats["missing"] += 1
+                if bucket:
+                    recheck_stats[f"{item['source']}_{bucket}_missing"] += 1
             h_match = batch_counts.get("heuristic_match", 0)
             h_miss = batch_counts.get("heuristic_mismatch", 0)
             if h_match or h_miss:
-                heuristic_tuner.record_batch(h_match, h_miss)
+                avg_conf = (confidence_total / confidence_n) if confidence_n else None
+                heuristic_tuner.record_batch(h_match, h_miss, avg_conf)
         recheck_futures = remaining
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex, ThreadPoolExecutor(max_workers=RECHECK_MAX_WORKERS) as rex:
@@ -827,18 +1021,45 @@ def main():
                 continue
 
             # fast heuristic (skip DeepSeek if confident)
-            guess = heuristic_label(text)
-            if guess:
+            decision = heuristic_decision(text)
+            if decision:
+                guess = decision.label
                 heuristic_usage["total"] += 1
                 heuristic_usage[guess] += 1
+                heuristic_confidence_accum += decision.confidence
+                if decision.confidence >= 0.65:
+                    conf_bucket = "high"
+                elif decision.confidence >= 0.42:
+                    conf_bucket = "mid"
+                else:
+                    conf_bucket = "low"
+                heuristic_usage[f"confidence_{conf_bucket}"] += 1
                 writer_q.put([{"id": cid, "text": text, "language": guess}])
                 cache_pairs.append((h, guess))
                 total += 1
                 if len(cache_pairs) >= 2000:
                     cache_set_many(cache_pairs)
                     cache_pairs = []
+                feature_keys = (
+                    "sw_ratio",
+                    "sheng_ratio",
+                    "english_ratio",
+                    "ascii_ratio",
+                    "sw_affix_ratio",
+                    "english_suffix_ratio",
+                )
+                diag_features = {
+                    k: round(float(decision.features.get(k, 0.0)), 3) for k in feature_keys
+                }
+                diag = {
+                    "confidence": round(float(decision.confidence), 4),
+                    "bucket": conf_bucket,
+                    "reason": decision.reason,
+                    "scores": {k: round(float(v), 3) for k, v in decision.scores.items()},
+                    "features": diag_features,
+                }
                 if heuristic_tuner.should_recheck():
-                    schedule_recheck(rex, cid, text, guess, h, "heuristic")
+                    schedule_recheck(rex, cid, text, guess, h, "heuristic", diag)
                 continue
 
             item = {"id": cid, "text": text}
@@ -954,6 +1175,10 @@ def main():
             "🤖 Heuristic usage: "
             + ", ".join(f"{k}={v}" for k, v in sorted(heuristic_usage.items()))
         )
+        total_h = heuristic_usage.get("total", 0)
+        if total_h:
+            avg_conf = heuristic_confidence_accum / total_h
+            logging.info(f"📐 Heuristic avg confidence: {avg_conf:.2f}")
         logging.info(
             "⚙️ Final heuristic thresholds: "
             + ", ".join(
