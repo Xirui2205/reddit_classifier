@@ -47,6 +47,13 @@ RECHECK_MAX_WORKERS = 2          # low concurrency to avoid extra load
 # --- Memory safety ---
 ORIGINAL_MAP_LIMIT = 20_000      # cap stored originals for alignment
 
+# --- Heuristic guardrails ---
+HEURISTIC_DIRECT_CONFIDENCE = 0.86
+HEURISTIC_DIRECT_MAX_RATE = 0.25
+HEURISTIC_DIRECT_RECHECK_GATE = 0.32
+HEURISTIC_HINT_MIN_CONFIDENCE = 0.25
+HEURISTIC_FEEDBACK_FLUSH = 40
+
 # ---------------- API KEY/BASE ----------------
 import openai
 openai.api_key = "sk-33a98b12f11f4300857e5ca93bf90e24"
@@ -551,7 +558,9 @@ SYSTEM_PROMPT = (
     "- 'Sheng': Nairobi urban slang, youthful tone, or heavy Swahili-English blending with slangy spellings.\n"
     "- 'English': plain English (allowing occasional Swahili interjections that do not change the dominant language).\n"
     "Instructions:\n"
-    "- Each input line is a JSON object with fields {id, text}; respond with ONE JSON line {\"id\":...,\"language\":...}.\n"
+    "- Each input line is a JSON object with fields {id, text}; some also include an optional \"heuristic_hint\" {label, confidence, reason}.\n"
+    "- Treat \"heuristic_hint\" only as soft context and always return your own judgment.\n"
+    "- Respond with ONE JSON line {\"id\":...,\"language\":...}.\n"
     "- Preserve order, emit no explanations, markdown, or blank lines.\n"
     "- Always choose exactly one label. If text is slangy but intelligible, prefer 'Sheng'.\n"
     "- Treat obvious metadata, URLs, or emojis as neutral context and classify by the surrounding language.\n"
@@ -569,7 +578,11 @@ def make_user_block(batch):
             words = txt.split()
             words = words[: min(len(words), 2500)]
             txt = " ".join(words)
-        lines.append(json.dumps({"id": b["id"], "text": txt}, ensure_ascii=False))
+        payload = {"id": b["id"], "text": txt}
+        hint = b.get("heuristic_hint") if isinstance(b, dict) else None
+        if isinstance(hint, dict) and hint.get("label"):
+            payload["heuristic_hint"] = hint
+        lines.append(json.dumps(payload, ensure_ascii=False))
     return "\n".join(lines)
 
 # ---------------- DEEPSEEK CALL ----------------
@@ -803,6 +816,31 @@ def main():
     recheck_futures = []
     recheck_stats = Counter()
     recheck_seq = 0
+    heuristic_pending = {}
+    heuristic_feedback_counts = Counter()
+    heuristic_feedback_conf_total = 0.0
+    heuristic_feedback_conf_n = 0
+
+    def flush_heuristic_feedback(force: bool = False):
+        nonlocal heuristic_feedback_counts, heuristic_feedback_conf_total, heuristic_feedback_conf_n
+        total_fb = heuristic_feedback_counts.get("match", 0) + heuristic_feedback_counts.get("mismatch", 0)
+        if not force and total_fb < HEURISTIC_FEEDBACK_FLUSH:
+            return
+        if total_fb <= 0:
+            return
+        avg_conf = (
+            heuristic_feedback_conf_total / heuristic_feedback_conf_n
+            if heuristic_feedback_conf_n
+            else None
+        )
+        heuristic_tuner.record_batch(
+            int(heuristic_feedback_counts.get("match", 0)),
+            int(heuristic_feedback_counts.get("mismatch", 0)),
+            avg_conf,
+        )
+        heuristic_feedback_counts.clear()
+        heuristic_feedback_conf_total = 0.0
+        heuristic_feedback_conf_n = 0
 
     def submit_batch(executor, batch):
         if not batch:
@@ -813,7 +851,8 @@ def main():
         pending_batches[fut] = [dict(item) for item in batch]
 
     def write_results(results, original_by_id, expected_lookup=None):
-        nonlocal total, cache_pairs
+        nonlocal total, cache_pairs, heuristic_pending
+        nonlocal heuristic_feedback_counts, heuristic_feedback_conf_total, heuristic_feedback_conf_n
         out = []
         processed_ids = set()
         for r in results:
@@ -832,6 +871,32 @@ def main():
             # persistent cache
             if text:
                 cache_pairs.append((md5_hash(text), lang))
+
+            pending_diag = heuristic_pending.pop(cid, None)
+            if pending_diag:
+                expected_label = pending_diag.get("expected")
+                conf_val = pending_diag.get("confidence")
+                if isinstance(conf_val, (int, float)):
+                    heuristic_feedback_conf_total += float(conf_val)
+                    heuristic_feedback_conf_n += 1
+                if expected_label:
+                    if lang == expected_label:
+                        heuristic_feedback_counts["match"] += 1
+                        heuristic_usage["hint_match"] += 1
+                    else:
+                        heuristic_feedback_counts["mismatch"] += 1
+                        heuristic_usage["hint_mismatch"] += 1
+                        msg = (
+                            f"Heuristic hint disagreed with DeepSeek for {cid}: "
+                            f"expected {expected_label}, got {lang}"
+                        )
+                        if isinstance(conf_val, (int, float)):
+                            msg += f" (conf={float(conf_val):.2f})"
+                        reason = pending_diag.get("reason")
+                        if reason:
+                            msg += f" reason={reason}"
+                        logging.info(msg)
+                flush_heuristic_feedback()
 
         if out:
             writer_q.put(out)
@@ -854,6 +919,13 @@ def main():
                 skip_stats["missing_text_for_retry"] += 1
                 continue
             payload = {"id": cid, "text": text}
+            pending_hint = heuristic_pending.get(cid)
+            if pending_hint and pending_hint.get("expected"):
+                payload["heuristic_hint"] = {
+                    "label": pending_hint.get("expected"),
+                    "confidence": round(float(pending_hint.get("confidence", 0.0)), 3),
+                    "reason": pending_hint.get("reason"),
+                }
             recovered = False
             for attempt in range(1, RETRIES + 1):
                 single_result = deepseek_batch([payload])
@@ -867,8 +939,9 @@ def main():
             if not recovered:
                 skip_stats["unrecoverable_model_output"] += 1
                 original_map.pop(cid, None)
+                heuristic_pending.pop(cid, None)
                 logging.error(
-                    f"Failed to recover classification for {cid} after {RETRIES} retries; skipping." 
+                    f"Failed to recover classification for {cid} after {RETRIES} retries; skipping."
                 )
 
     # Maintain a sliding dict of originals for batch alignment
@@ -1020,7 +1093,9 @@ def main():
                     schedule_recheck(rex, cid, text, cached, h, "cache")
                 continue
 
-            # fast heuristic (skip DeepSeek if confident)
+            item = {"id": cid, "text": text}
+
+            # heuristic suggestion (prefer DeepSeek for most cases)
             decision = heuristic_decision(text)
             if decision:
                 guess = decision.label
@@ -1034,12 +1109,7 @@ def main():
                 else:
                     conf_bucket = "low"
                 heuristic_usage[f"confidence_{conf_bucket}"] += 1
-                writer_q.put([{"id": cid, "text": text, "language": guess}])
-                cache_pairs.append((h, guess))
-                total += 1
-                if len(cache_pairs) >= 2000:
-                    cache_set_many(cache_pairs)
-                    cache_pairs = []
+
                 feature_keys = (
                     "sw_ratio",
                     "sheng_ratio",
@@ -1058,11 +1128,55 @@ def main():
                     "scores": {k: round(float(v), 3) for k, v in decision.scores.items()},
                     "features": diag_features,
                 }
-                if heuristic_tuner.should_recheck():
-                    schedule_recheck(rex, cid, text, guess, h, "heuristic", diag)
-                continue
 
-            item = {"id": cid, "text": text}
+                direct_eligible = decision.confidence >= HEURISTIC_DIRECT_CONFIDENCE
+                took_direct = False
+                if direct_eligible and heuristic_tuner.recheck_prob <= HEURISTIC_DIRECT_RECHECK_GATE:
+                    processed_so_far = max(1, total + 1)
+                    projected_ratio = (
+                        (heuristic_usage.get("direct_total", 0) + 1)
+                        / processed_so_far
+                    )
+                    if total < 20:
+                        projected_ratio = 0.0
+                    if projected_ratio <= HEURISTIC_DIRECT_MAX_RATE:
+                        heuristic_usage["direct_total"] += 1
+                        heuristic_usage[f"direct_{guess}"] += 1
+                        writer_q.put([{"id": cid, "text": text, "language": guess}])
+                        cache_pairs.append((h, guess))
+                        total += 1
+                        if len(cache_pairs) >= 2000:
+                            cache_set_many(cache_pairs)
+                            cache_pairs = []
+                        trigger_recheck = heuristic_tuner.should_recheck() or decision.confidence < 0.9
+                        if trigger_recheck:
+                            schedule_recheck(rex, cid, text, guess, h, "heuristic", diag)
+                        took_direct = True
+                        continue
+                    else:
+                        heuristic_usage["direct_limited"] += 1
+                elif direct_eligible:
+                    heuristic_usage["direct_blocked"] += 1
+
+                if not took_direct:
+                    if decision.confidence >= HEURISTIC_HINT_MIN_CONFIDENCE:
+                        heuristic_usage["hint_total"] += 1
+                        heuristic_pending[cid] = {
+                            "expected": guess,
+                            "confidence": float(decision.confidence),
+                            "reason": decision.reason,
+                            "scores": {k: float(v) for k, v in decision.scores.items()},
+                            "features": diag_features,
+                            "bucket": conf_bucket,
+                        }
+                        item["heuristic_hint"] = {
+                            "label": guess,
+                            "confidence": round(float(decision.confidence), 3),
+                            "reason": decision.reason,
+                        }
+                    else:
+                        heuristic_usage["hint_suppressed"] += 1
+
             original_map[cid] = text
             original_map.move_to_end(cid)
             while len(original_map) > ORIGINAL_MAP_LIMIT:
@@ -1158,6 +1272,13 @@ def main():
 
     # split temps to final channel files
     split_to_final_files()
+
+    flush_heuristic_feedback(force=True)
+    if heuristic_pending:
+        logging.warning(
+            f"Clearing {len(heuristic_pending)} heuristic hint(s) without model confirmation."
+        )
+        heuristic_pending.clear()
 
     if skip_stats:
         logging.info(
