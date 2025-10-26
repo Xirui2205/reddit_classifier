@@ -15,6 +15,7 @@ DEFAULT_SAMPLE_SIZE = 1000
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_RETRIES = 3
 DEFAULT_SLEEP = 0.5
+DEFAULT_TEMPERATURE = 0.0
 DEFAULT_API_KEY = "sk-33a98b12f11f4300857e5ca93bf90e24"
 
 SYSTEM_PROMPT = (
@@ -53,6 +54,8 @@ def parse_args() -> argparse.Namespace:
                         help="Number of retry attempts per batch (default: %(default)s)")
     parser.add_argument("--sleep", type=float, default=DEFAULT_SLEEP,
                         help="Seconds to wait between successful batches (default: %(default)s)")
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
+                        help="Sampling temperature for the model (default: %(default)s)")
     parser.add_argument("--api-key", dest="api_key", default=None,
                         help="Override API key for DeepSeek (default: env/constant)")
     return parser.parse_args()
@@ -82,19 +85,27 @@ def read_comments(path: str) -> List[Dict[str, Any]]:
                 continue
             if not isinstance(obj, dict):
                 continue
-            if "id" not in obj or "text" not in obj:
+            # The source files can expose the comment text via either a "text" or
+            # "body" field. Accept both so we can run against the cleaner output
+            # without rewriting the data on disk.
+            if "id" not in obj:
                 continue
-            comments.append({"id": str(obj["id"]), "text": str(obj["text"])})
+            text_val = obj.get("text") or obj.get("body")
+            if text_val is None:
+                continue
+            comments.append({"id": str(obj["id"]), "text": str(text_val)})
     return comments
 
 
-def choose_sample(comments: List[Dict[str, Any]], size: int) -> List[Dict[str, Any]]:
+def choose_sample(
+    comments: List[Dict[str, Any]], size: int, rng: random.Random
+) -> List[Dict[str, Any]]:
     if size >= len(comments):
         print(
             f"Requested sample of {size} comments but only {len(comments)} available; using all comments."
         )
-        return comments
-    return random.sample(comments, size)
+        return list(comments) if not comments else rng.sample(comments, len(comments))
+    return rng.sample(comments, size)
 
 
 def chunked(data: List[Dict[str, Any]], chunk_size: int) -> Iterable[List[Dict[str, Any]]]:
@@ -116,7 +127,7 @@ def classify_batch(batch: List[Dict[str, Any]], args: argparse.Namespace) -> Lis
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": payload},
                 ],
-                temperature=0,
+                temperature=args.temperature,
                 max_tokens=3000,
             )
             content = response["choices"][0]["message"]["content"].strip()
@@ -143,8 +154,13 @@ def main() -> None:
     if args.sample_size <= 0:
         raise SystemExit("Sample size must be a positive integer")
 
+    rng = random.Random()
     if args.seed is not None:
-        random.seed(args.seed)
+        rng.seed(args.seed)
+
+    # Avoid mutating global random state so repeated runs without --seed remain random.
+    if args.seed is None:
+        rng.seed()
 
     configure_api(args)
 
@@ -152,7 +168,7 @@ def main() -> None:
     if not comments:
         raise SystemExit(f"No comments found in {args.input_path}")
 
-    sample = choose_sample(comments, args.sample_size)
+    sample = choose_sample(comments, args.sample_size, rng)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -177,7 +193,9 @@ def main() -> None:
         "sampled": len(sample),
         "output_file": str(output_path),
         "model": args.model,
+        "temperature": args.temperature,
         "generated_at": timestamp,
+        "seed": args.seed,
     }
     meta_path = output_dir / f"sample_{len(sample)}_{timestamp}_meta.json"
     with open(meta_path, "w", encoding="utf-8") as meta_file:
